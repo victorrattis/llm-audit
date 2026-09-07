@@ -20,4 +20,4 @@ node_modules/
 # system prompt, tool schemas, every message and every tool result — so it is
 # never something to commit, however convenient the path.
 *audit-log*/
-*audit-simple*/
+*llm-audit*/
