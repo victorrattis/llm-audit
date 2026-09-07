@@ -165,6 +165,7 @@ export type Attributed = {
 // diffed against it.
 export type Fingerprint = {
   turn: number
+  agent?: string
   system: string
   tools: string
   messages: string[]
@@ -425,6 +426,7 @@ function reviveHistory(value: unknown): Map<string, Fingerprint> {
     if (!Array.isArray(entry["messages"]) || !Array.isArray(entry["chars"])) continue
     map.set(key, {
       turn: num(entry["turn"]),
+      agent: str(entry["agent"]),
       system: entry["system"],
       tools: entry["tools"],
       messages: strings(entry["messages"]),
@@ -1238,6 +1240,7 @@ export function track(
   const key = [sessionID ?? "?", model ?? context?.model.id ?? "", prompt.dialect]
   const next: Fingerprint = {
     turn,
+    agent: context?.agent || undefined,
     system: hash(prompt.system.map((piece) => piece.stable).join("\n")),
     tools: hash(prompt.tools.map((piece) => piece.stable).join("\n")),
     messages: prompt.messages.map((piece) => piece.stable ?? ""),
@@ -1246,6 +1249,13 @@ export function track(
   const previous = sess.history.get(key.join("|"))
   sess.history.set(key.join("|"), next)
   if (!previous) return undefined
+  // The agent splits the chain further, but only when both sides say which one
+  // they are: opencode runs its side agents (`title`, `summarize`) on the
+  // session's own id, and diffing the build agent's first prompt against the
+  // title agent's produces a turn where everything diverged at message #0 and
+  // the user's own message reads as new, having travelled twice. An unknown
+  // agent is not a different one, though — that would drop a good diff.
+  if (previous.agent && next.agent && previous.agent !== next.agent) return undefined
   return compare(previous, next)
 }
 

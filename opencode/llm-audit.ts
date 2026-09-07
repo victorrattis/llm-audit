@@ -370,6 +370,7 @@ type Attributed = {
 // diffed against it.
 type Fingerprint = {
   turn: number
+  agent?: string
   system: string
   tools: string
   messages: string[]
@@ -1632,6 +1633,7 @@ function reviveHistory(value: unknown): Map<string, Fingerprint> {
     if (!Array.isArray(entry["messages"]) || !Array.isArray(entry["chars"])) continue
     map.set(key, {
       turn: num(entry["turn"]),
+      agent: str(entry["agent"]),
       system: entry["system"],
       tools: entry["tools"],
       messages: strings(entry["messages"]),
@@ -2788,12 +2790,11 @@ function track(
 ): Reuse | undefined {
   if (!prompt) return undefined
   // The chains live on the session, so two conversations can never be diffed
-  // against each other. Within one folder there is still a chain per session id
-  // — a subagent files here but is its own conversation — and per model and
-  // dialect, so a small model called for titles does not read as a break.
+  // against each other — `chainOf` says what counts as one.
   const key = chainOf(sessionID, context, model, prompt.dialect)
   const next: Fingerprint = {
     turn,
+    agent: context?.agent || undefined,
     system: hash(prompt.system.map((piece) => piece.stable).join("\n")),
     tools: hash(prompt.tools.map((piece) => piece.stable).join("\n")),
     messages: prompt.messages.map((piece) => piece.stable ?? ""),
@@ -2803,6 +2804,13 @@ function track(
   const previous = sess.history.get(key)
   sess.history.set(key, next)
   if (!previous) return undefined
+  // The agent narrows the chain, but only when both sides say which one they
+  // are: the side agents (`title`, `summarize`) run on the session's own id, and
+  // diffing the build agent's first prompt against the title agent's produces a
+  // turn where everything diverged at message #0 and the user's own message
+  // reads as new, having travelled twice. An unknown agent is not a different
+  // one, though — that would drop a good diff.
+  if (previous.agent && next.agent && previous.agent !== next.agent) return undefined
   const diff = compare(previous, next)
   // Saying the prefix broke at index 12 leaves the reading to be done by hand.
   // Naming the message, and pointing at both versions of it in the store, is
@@ -2826,6 +2834,10 @@ function track(
  * not a break in the coding model's history. Both the reuse diff and the retry
  * check key off it, so they must agree on what it is.
  */
+/** One conversation, for the purpose of diffing prompts against each other: a
+ *  chain per session id — a subagent files here but is its own conversation —
+ *  and per model and dialect, so a small model called for titles does not read
+ *  as a break. The agent narrows it further, in `track`. */
 function chainOf(
   sessionID: string | undefined,
   context: Context | undefined,
