@@ -22,31 +22,48 @@
 //
 // and each of those is:
 //
-//   { "request":  { method, url, dialect, settings, chars, cache, prompt, headers },
-//     "response": { status, id, model, finish_reason, usage, reply, headers } }
+//   { turn, session, agent, provider, model, started_at, elapsed_seconds, ...,
+//     "usage":    { input, cache_read, cache_write, output, prompt, total, source },
+//     "reply":    { text, reasoning, tool_calls, stop_reason },
+//     "request":  { method, url, dialect, chars, cache, body, headers },
+//     "response": { status, id, model, finish_reason, request_id, bytes, headers } }
 //
-// The request keeps every byte that went out — the system prompt, the tool
-// schemas and every message, exactly as they were sent, cache markers and all.
-// The repetition between turns is the point rather than noise: the model holds
-// no state, so each turn resends the whole conversation, and that is precisely
-// what the prompt cache is charging for. Only the shape is normalized, because
-// each dialect hides the same three things somewhere else:
+// That layout is the one `harness-audit-viewer/viewer.html` reads, and it is
+// the reason the bill and the answer sit at the top of the file rather than
+// inside `response`: the viewer keys the whole decoded format off
+// `request.body`, and reads `usage`, `reply`, `cache_hit_rate`, `error`,
+// `incomplete` and `note` off the turn itself. Nothing here exists only for the
+// viewer — every field is one an audit asks for — but where a name or a
+// position was free, it is the one the viewer already knows.
 //
-//   prompt     `system`, `tools` and `messages`, whatever the provider calls
-//              them — `input`/`instructions` on the Responses dialect (where
-//              opencode sends the system prompt as a `developer` item),
-//              `contents`/`systemInstruction` on Gemini, `toolConfig.tools` on
-//              Bedrock. The items inside are untouched
-//   settings   everything else in the body, by subtraction rather than by a
-//              list of known keys — that is how `thinking`, `service_tier`,
-//              `include`, `generationConfig` and whatever the next provider
-//              invents stay in the record instead of being dropped
+// The request keeps every byte that went out, in `body`, exactly as it was
+// sent — the system prompt, the tool schemas, every message, the sampling
+// settings and the cache markers, in the dialect's own shape rather than a
+// redistribution of it. The repetition between turns is the point rather than
+// noise: the model holds no state, so each turn resends the whole conversation,
+// and that is precisely what the prompt cache is charging for. Beside the body
+// go the three things a reader would otherwise have to derive, and only those:
+//
+//   dialect    which API the body speaks — "anthropic", "openai-chat",
+//              "openai-responses", "gemini", "bedrock" —, read off its keys and
+//              not off the URL: gateways and proxies rewrite paths, the body
+//              keys are the contract
 //   cache      what the request asked to cache, under one name: the `key`
 //              (`prompt_cache_key`, `cachedContent`) or the `breakpoints`
 //              (Anthropic's `cache_control`, Bedrock's positional `cachePoint`),
 //              each saying which part and which index it sits at
-//   chars      the size of each of the three parts, which is what shows the
-//              system and the tools standing still while the messages grow
+//   chars      the characters the body occupied on the wire, which is what shows
+//              the prompt growing turn after turn. Taken from the bytes, not
+//              measured: the split across the three parts is a reading of the
+//              body, and the body is right there to read
+//
+// The recorder runs inside every `fetch` the process makes, so the cost of
+// deciding *not* to record is paid far more often than the cost of recording.
+// Hence the rule the code keeps: nothing is parsed, serialized or walked until
+// a scan of the raw bytes says this request is worth it. A body is parsed once,
+// at the door, and carried from there; the cache markers are walked in the
+// parsed structure rather than in a second copy of it as text; and the size of
+// the prompt is read off the string instead of being summed.
 //
 // The response is the opposite: the frames are folded into the answer they
 // describe, because a stream is the same reply written twice, in pieces, in a
@@ -57,17 +74,17 @@
 //                 is not always the model that was asked for
 //   finish_reason "stop" | "length" | "tool-calls" | "content-filter" |
 //                 "error" | "unknown" — opencode's own vocabulary (see
-//                 `packages/llm/src/schema/ids.ts`), with the provider's word
-//                 for it kept beside it as `finish_reason_native`
+//                 `packages/llm/src/schema/ids.ts`). The provider's own word
+//                 for it is on the reply, as `reply.stop_reason`, once
 //   usage         the token bill, normalized so the prompt counters never
 //                 overlap: prompt = input + cache_read + cache_write, and
 //                 reasoning is part of output rather than added to it. The
 //                 provider's own usage object is kept verbatim as `native`,
 //                 so a mapping that is wrong is still a mapping you can redo
-//   reply         what the model said: text, reasoning, and the tool calls
-//                 with their ids, names and parsed arguments. The id is the
-//                 join with the tool result that comes back in the next
-//                 turn's request
+//   reply         what the model said: text, reasoning, the tool calls with
+//                 their ids, names and parsed arguments, and why it stopped.
+//                 The tool call id is the join with the tool result that comes
+//                 back in the next turn's request
 //
 // `raw` comes back only when none of that could be decoded, so a dialect this
 // file does not know still leaves its bytes behind rather than an empty turn.
@@ -77,7 +94,7 @@
 // verbatim, so treat the directory as sensitive.
 //
 // How it hooks in: it wraps the process's `fetch` and records the calls whose
-// shape says "model request" (see `isModelCall`), so it covers every provider —
+// shape says "model request" (see `modelCall`), so it covers every provider —
 // the bytes recorded are the bytes on the wire. The one hook it uses,
 // `chat.params`, only reads the session id and never writes to its output, so
 // arming this cannot change what opencode does.
@@ -101,8 +118,19 @@ const TEXT_CONTENT = /^(text\/|application\/(json|x-ndjson|jsonl|.*\+json))/i
 // messages, Gemini generateContent, Bedrock converse/invoke, Cohere-style chat.
 const MODEL_PATH =
   /(chat\/completions|\/completions|\/responses|\/messages|generatecontent|\/converse|\/invoke|\/predict|\/chat)(\b|$)/i
-// Body keys that mean "this is a prompt", across every dialect.
-const PROMPT_KEY = /"(messages|contents|system_instruction|systemInstruction)"\s*:/
+/**
+ * The cheap gate: a POST whose bytes spell none of these is not a model call,
+ * and is turned away before anything parses it.
+ *
+ * Two things in one pass, because a body that fails is scanned to its end and
+ * the traffic that fails is the common case — a second scan would double the
+ * cost of every request this file does not want. The first alternative is the
+ * key that means "this is a prompt", whatever the dialect calls it; the second
+ * is the model named in the body, which is what still catches the OpenAI
+ * Responses dialect (it names the model but calls its prompt `input`) and a
+ * gateway that rewrote the path out of recognition.
+ */
+const MODEL_BODY = /"(messages|contents|system_instruction|systemInstruction)"\s*:|"model"\s*:\s*"/
 
 // Turns that arrive without a session id still have to be written somewhere.
 const NO_SESSION = "sem-sessao"
@@ -184,6 +212,18 @@ const FINISH = new Map([
 
 type FetchLike = typeof globalThis.fetch
 
+/**
+ * One outgoing model request, as the recorder sees it: the bytes that went out
+ * and the body they parse to, parsed once at the door and carried from there.
+ */
+type Wire = {
+  method: string
+  url: string
+  raw: string
+  body: Record<string, unknown>
+  headers: Record<string, string>
+}
+
 type Settings = { enabled: boolean; dir: string }
 
 /**
@@ -202,19 +242,30 @@ type Usage = {
   input: number
   cache_read?: number
   cache_write?: number
-  // The TTL split of the cache write, when the provider reports it: the two are
-  // billed at different multipliers.
-  cache_write_5m?: number
-  cache_write_1h?: number
   output: number
   reasoning?: number
   prompt: number
   total: number
-  // `cache_read / prompt`, kept next to the numbers it comes from.
-  cache_hit_rate?: number
-  // The provider's own total, written only when it disagrees with the sum
-  // above — silence means the two agree.
-  reported_total?: number
+  // Where these numbers came from. Always "provider" here: this file only ever
+  // transcribes a count the provider reported, and drops the `usage` object
+  // entirely when it reported none — it never estimates. Written all the same,
+  // because a reader that cannot tell a measured number from a guessed one
+  // treats every log as measured.
+  source: "provider"
+  // The second-order counters: the ones that qualify the bill rather than being
+  // it. Absent when the provider reported none of them.
+  details?: {
+    // The TTL split of the cache write, when the provider reports it: the two
+    // are billed at different multipliers.
+    cache_write_5m?: number
+    cache_write_1h?: number
+    // The provider's own total, and how far it sits from the sum above. Both
+    // written only when the two disagree — silence means they agree, and a
+    // number here means a counter this file did not read, so the total above is
+    // short by exactly that much.
+    reported_total?: number
+    total_mismatch?: number
+  }
   // The provider's own usage object, exactly as it reported it. The normalized
   // fields above are a reading of this; this is the evidence.
   native: Record<string, unknown>
@@ -410,8 +461,15 @@ function install(state: State) {
   if (global["__opencodeSimpleAuditFetch"]) return
   const original = globalThis.fetch
   const patched = (input: Parameters<FetchLike>[0], init?: Parameters<FetchLike>[1]) => {
-    const request = describeRequest(input, init)
-    if (!isModelCall(request)) return original(input, init)
+    const method = (init?.method ?? methodOf(input) ?? "GET").toUpperCase()
+    const raw = rawBody(init?.body)
+    const url = urlOf(input)
+    const body = modelCall(method, url, raw)
+    if (!body) return original(input, init)
+    // Only a model call pays for the headers: redacting them builds a `Headers`
+    // and walks it, and by here the traffic is the traffic worth recording.
+    const request: Wire = { method, url, raw: raw as string, body,
+                            headers: redactHeaders(init?.headers ?? headersOf(input)) }
     return capture(state, request, () => original(input, init))
   }
   // Carries over anything the runtime hangs off fetch (Bun's `preconnect`).
@@ -422,24 +480,35 @@ function install(state: State) {
 }
 
 /**
+ * The parsed body of a model call, or nothing — which is also the answer to
+ * "should this request be recorded at all?".
+ *
  * A model call POSTs a JSON body shaped like a prompt. Both halves matter: the
  * shape alone would catch opencode's own APIs, and the path alone would catch
  * unrelated traffic to the same hosts.
+ *
+ * The order is the point. `fetch` is wrapped for the whole process, so this runs
+ * on every call the process makes, and the parse is the expensive step —
+ * proportional to a body that, for a warm conversation, is most of a megabyte.
+ * So the bytes are scanned first, and only a body that already looks like a
+ * prompt or already names a model is ever parsed. Everything else — telemetry,
+ * opencode's own APIs, whatever else the process talks to — is turned away for
+ * the cost of one scan of the bytes. What is *recorded* is unchanged: the tests below the
+ * gate are the same ones, on the same parsed keys.
  */
-function isModelCall(request: ReturnType<typeof describeRequest>) {
-  if (request.method !== "POST" || typeof request.raw !== "string") return false
-  if (!PROMPT_KEY.test(request.raw) && !isRecord(request.body)) return false
-  if (!isRecord(request.body)) return false
+function modelCall(method: string, url: string, raw: string | undefined) {
+  if (method !== "POST" || typeof raw !== "string") return undefined
+  if (!MODEL_BODY.test(raw)) return undefined
+  const body = record(json(raw))
+  if (!body) return undefined
   const shape =
-    "messages" in request.body ||
-    "contents" in request.body ||
-    "prompt" in request.body ||
-    ("input" in request.body && "model" in request.body)
-  if (!shape) return false
-  return MODEL_PATH.test(pathOf(request.url)) || typeof request.body["model"] === "string"
+    "messages" in body || "contents" in body || "prompt" in body || ("input" in body && "model" in body)
+  if (!shape) return undefined
+  const named = MODEL_PATH.test(pathOf(url)) || typeof body["model"] === "string"
+  return named ? body : undefined
 }
 
-async function capture(state: State, request: ReturnType<typeof describeRequest>, send: () => Promise<Response>) {
+async function capture(state: State, request: Wire, send: () => Promise<Response>) {
   const started = Date.now()
   // opencode names the session on every request it makes, and a subagent also
   // names whoever spawned it — its turns are that conversation's work, so they
@@ -620,6 +689,44 @@ function ratesOf(context: Context | undefined, prompt: number) {
   }
 }
 
+/**
+ * The turn file, assembled.
+ *
+ * What the answer *was* sits at the top of the file, beside what was asked —
+ * the bill, the reply, the failure —, and only the transport stays under
+ * `response`: the status, the ids, the bytes, the headers. That is the order a
+ * reader wants, and it is the order `harness-audit-viewer` reads, which looks
+ * for `usage`, `reply`, `cache_hit_rate`, `error`, `incomplete` and `note` on
+ * the turn itself.
+ *
+ * A field the response never carried is left out rather than written as null:
+ * the absence says "did not happen", where a null claims it did and came back
+ * empty. A request that never became a response leaves no `response` at all.
+ */
+function turnOf(head: Record<string, unknown>, request: unknown, response: Record<string, unknown>) {
+  const { usage, reply, error, incomplete, note, ...transport } = response
+  const bill = record(usage)
+  return {
+    ...head,
+    ...(bill
+      ? {
+          usage: bill,
+          // `cache_read / prompt`, written once and on the turn rather than
+          // inside the usage object it is derived from.
+          cache_hit_rate:
+            num(bill["prompt"]) && bill["cache_read"] !== undefined
+              ? round2(num(bill["cache_read"]) / num(bill["prompt"]))
+              : undefined,
+        }
+      : {}),
+    ...(reply !== undefined ? { reply } : {}),
+    ...(error !== undefined ? { error } : {}),
+    ...(incomplete !== undefined ? { incomplete, note } : {}),
+    request,
+    ...(Object.keys(transport).length ? { response: transport } : {}),
+  }
+}
+
 /** The turn file, and the line about it in the folder's index. */
 function write(
   state: State,
@@ -630,9 +737,11 @@ function write(
   response: Record<string, unknown>,
 ) {
   state.pending.delete(file)
+  // The row is built from the response as it came, before `turnOf` splits it:
+  // the index is the plugin's own, and nothing in it moved.
   sess.rows.push(rowOf(head, path.basename(file), request, response))
   state.queue = state.queue
-    .then(() => fs.promises.writeFile(file, text({ ...head, request, response })))
+    .then(() => fs.promises.writeFile(file, text(turnOf(head, request, response))))
     .then(() => fs.promises.writeFile(path.join(sess.dir, INDEX_FILE), text(index(sess))))
     .catch(() => undefined)
 }
@@ -669,7 +778,7 @@ function rowOf(head: Record<string, unknown>, file: string, request: unknown, re
     usage: usage ? { ...usage, native: undefined } : null,
     rates_per_million: head["rates_per_million"],
     rates_tier: head["rates_tier"],
-    chars: num(record(record(request)?.["chars"])?.["total"]) || undefined,
+    chars: num(record(request)?.["chars"]) || undefined,
     tools: reply ? arrayOf(reply["tool_calls"]).map((call) => record(call)?.["name"]) : undefined,
     // A turn that never came back may have cost tokens nobody can count, and a
     // turn the provider rejected bought nothing. Both have to be visible as
@@ -712,7 +821,7 @@ function flush(state: State) {
       touched.add(sess)
     }
     try {
-      fs.writeFileSync(file, text({ ...head, request, response }))
+      fs.writeFileSync(file, text(turnOf(head, request, response)))
     } catch {
       // Nothing useful to do at exit.
     }
@@ -821,32 +930,30 @@ function stamp(date: Date) {
   ].join("")
 }
 
-function describeRequest(input: unknown, init: { method?: string; headers?: unknown; body?: unknown } | undefined) {
-  const raw = rawBody(init?.body)
-  return {
-    method: (init?.method ?? methodOf(input) ?? "GET").toUpperCase(),
-    url: urlOf(input),
-    headers: redactHeaders(init?.headers ?? headersOf(input)),
-    raw,
-    body: typeof raw === "string" ? json(raw) : raw,
-  }
-}
-
 /**
- * The request, in one shape whatever the dialect speaks.
+ * The request: the body as it went out, and the little that has to be derived.
  *
- * Every item is kept exactly as it was sent, cache markers and all — the
- * repetition between turns is the point of the log, not noise: the model holds
- * no state, so each turn resends the whole conversation, and that is precisely
- * what the prompt cache is charging for. What changes here is only *where* the
- * three parts live, because each dialect hides them somewhere else.
+ * The body is stored whole and untouched — the system prompt, the tool schemas,
+ * every message, the sampling settings, the cache markers, in the dialect's own
+ * shape. The repetition between turns is the point of the log, not noise: the
+ * model holds no state, so each turn resends the whole conversation, and that is
+ * precisely what the prompt cache is charging for.
+ *
+ * The three parts are located rather than moved. Splitting the body into
+ * `system`/`tools`/`messages` and a leftover bag of settings was the older shape
+ * here, and it cost twice: it wrote the same bytes in a second arrangement, and
+ * the arrangement was lossy — the OpenAI dialects carry the system prompt as a
+ * message with a privileged role, so lifting it out loses where it sat in the
+ * list. Locating the parts is enough to measure them (`chars`) and to say where
+ * the cache markers are (`cache`); a reader that wants the parts themselves
+ * finds them in the body, by `dialect`.
  */
-function readRequest(request: ReturnType<typeof describeRequest>) {
+function readRequest(request: Wire) {
   const head = { method: request.method, url: redactUrl(request.url) }
   const body = record(request.body)
   const dialect = body ? dialectOf(body) : "unknown"
-  // Nothing is guessed about a dialect this file does not know: the body goes in
-  // whole, the way an undecodable response keeps its bytes.
+  // Nothing is derived about a dialect this file does not know: the body still
+  // goes in whole, the way an undecodable response keeps its bytes.
   if (!body || dialect === "unknown")
     return { ...head, dialect, body: request.body, headers: request.headers }
 
@@ -855,21 +962,18 @@ function readRequest(request: ReturnType<typeof describeRequest>) {
     tools: toolItems(body, dialect),
     messages: messageItems(body, dialect),
   }
-  const chars = {
-    total: 0,
-    system: sizeOf(prompt.system),
-    tools: sizeOf(prompt.tools),
-    messages: sizeOf(prompt.messages),
-  }
-  chars.total = chars.system + chars.tools + chars.messages
-
   return {
     ...head,
     dialect,
-    settings: settingsOf(body, dialect),
-    chars,
-    cache: cacheView(body, prompt),
-    prompt,
+    // The characters this turn put on the wire, taken from the bytes rather than
+    // measured: `raw.length` is free and exact, where summing the parts costs a
+    // serialization of the whole prompt and still misses the settings keys and
+    // the JSON punctuation around everything. The split across system, tools and
+    // messages is not written — nothing read it, and a reader who wants it has
+    // the body right here to take it from.
+    chars: request.raw.length,
+    cache: cacheView(body, prompt, request.raw),
+    body: request.body,
     headers: request.headers,
   }
 }
@@ -890,41 +994,6 @@ function dialectOf(body: Record<string, unknown>) {
     return "openai-chat"
   }
   return "unknown"
-}
-
-// The body keys each dialect spends on the prompt. Everything else is a
-// setting, by subtraction — see `settingsOf`.
-const PROMPT_KEYS: Record<string, string[]> = {
-  anthropic: ["system", "messages", "tools"],
-  "openai-chat": ["messages", "tools"],
-  "openai-responses": ["input", "instructions", "tools"],
-  gemini: ["contents", "systemInstruction", "system_instruction", "tools"],
-  bedrock: ["messages", "system", "toolConfig"],
-}
-
-/**
- * Everything in the body that is not the prompt — model, sampling, cache key,
- * whatever else the provider takes.
- *
- * Taken by subtraction rather than from a list of known keys, and that is the
- * whole point: the keys worth having are exactly the ones a fixed list would
- * miss. `thinking` (Anthropic), `service_tier`, `include` and `prompt_cache_key`
- * (Responses), `generationConfig` (Gemini), `additionalModelRequestFields`
- * (Bedrock) — none of them are in the setting list the full plugin keeps, and
- * the next provider will invent one more. Subtraction cannot miss any of them.
- */
-function settingsOf(body: Record<string, unknown>, dialect: string) {
-  const spent = new Set(PROMPT_KEYS[dialect] ?? [])
-  const settings: Record<string, unknown> = {}
-  for (const [name, value] of Object.entries(body)) if (!spent.has(name)) settings[name] = value
-  // Bedrock keeps `toolChoice` inside `toolConfig`, next to the tools that were
-  // lifted out of it. Only the tools were spent, so the rest comes back.
-  if (dialect === "bedrock") {
-    const config = { ...record(body["toolConfig"]) }
-    delete config["tools"]
-    if (Object.keys(config).length) settings["toolConfig"] = config
-  }
-  return settings
 }
 
 /**
@@ -1012,14 +1081,19 @@ function unwrap(tool: unknown, name: string) {
  * where they were — this only says where they are, so "where does the cached
  * prefix end" is one question rather than four conventions to know.
  */
-function cacheView(body: Record<string, unknown>, prompt: Record<string, unknown[]>) {
+function cacheView(body: Record<string, unknown>, prompt: Record<string, unknown[]>, raw: string) {
   const key = str(body["prompt_cache_key"]) ?? str(body["cachedContent"]) ?? str(body["cached_content"])
   const breakpoints: { in: string; index: number; type: string; ttl?: string }[] = []
-  for (const [part, items] of Object.entries(prompt))
-    items.forEach((item, index) => {
-      const marker = cacheOf(safeStringify(item))
-      if (marker) breakpoints.push({ in: part, index, ...marker })
-    })
+  // One scan of the bytes before any structure is walked. A body that never
+  // spells either marker has none to find — which is all of the OpenAI and
+  // Gemini traffic, and every request that asked for no caching — and the whole
+  // search below is skipped for it.
+  if (raw.includes('"cache_control"') || raw.includes('"cachePoint"'))
+    for (const [part, items] of Object.entries(prompt))
+      items.forEach((item, index) => {
+        const marker = cacheOf(item)
+        if (marker) breakpoints.push({ in: part, index, ...marker })
+      })
   // No key and no breakpoint is a request that asked for no caching at all,
   // which is a finding of its own — hence an absent field rather than an empty
   // one, so it reads as "nothing asked" and not as "nothing found".
@@ -1027,22 +1101,36 @@ function cacheView(body: Record<string, unknown>, prompt: Record<string, unknown
   return { key, breakpoints: breakpoints.length ? breakpoints : undefined }
 }
 
-function cacheOf(serial: string) {
-  const control = /"cache_control"\s*:\s*\{([^}]*)\}/.exec(serial)?.[1]
-  const point = /"cachePoint"\s*:\s*\{([^}]*)\}/.exec(serial)?.[1]
-  const inner = control ?? point
-  if (inner === undefined) return undefined
-  return {
-    // Anthropic names the kind of cache it wants; a Bedrock cache point carries
-    // only `"type":"default"`, which says nothing its position does not.
-    type: control ? (/"type"\s*:\s*"([^"]+)"/.exec(control)?.[1] ?? "ephemeral") : "point",
-    ttl: /"ttl"\s*:\s*"([^"]+)"/.exec(inner)?.[1],
+/**
+ * The cache marker inside one prompt item, if it carries one.
+ *
+ * Walked over the parsed item and stopped at the first hit, rather than read out
+ * of the item serialized: a message is worth kilobytes and a marker twenty
+ * characters, and building the former to find the latter is the whole cost of
+ * this file's cache view. The depth limit is against a cycle, not against
+ * nesting — a marker sits shallow, on the block that carries it.
+ */
+function cacheOf(item: unknown, depth = 0): { type: string; ttl?: string } | undefined {
+  if (depth > 6 || item === null || typeof item !== "object") return undefined
+  if (Array.isArray(item)) {
+    for (const child of item) {
+      const found = cacheOf(child, depth + 1)
+      if (found) return found
+    }
+    return undefined
   }
-}
-
-/** The characters a list of prompt items occupies on the wire. */
-function sizeOf(items: unknown[]) {
-  return items.reduce((total: number, item) => total + safeStringify(item).length, 0)
+  const entry = item as Record<string, unknown>
+  const control = record(entry["cache_control"])
+  // Anthropic names the kind of cache it wants; a Bedrock cache point carries
+  // only `"type":"default"`, which says nothing its position does not.
+  if (control) return { type: str(control["type"]) ?? "ephemeral", ttl: str(control["ttl"]) }
+  const point = record(entry["cachePoint"])
+  if (point) return { type: "point", ttl: str(point["ttl"]) }
+  for (const child of Object.values(entry)) {
+    const found = cacheOf(child, depth + 1)
+    if (found) return found
+  }
+  return undefined
 }
 
 /**
@@ -1084,11 +1172,11 @@ function describeResponse(
     id,
     model,
     finish_reason: finishReason(reply?.stop_reason, Boolean(reply?.tool_calls.length)),
-    finish_reason_native: reply?.stop_reason,
     usage,
-    // `stop_reason` is left off the reply itself: it is already above, twice,
-    // and a number written in two places is a number that gets to disagree.
-    reply: reply && { text: reply.text, reasoning: reply.reasoning, tool_calls: reply.tool_calls },
+    // The provider's own word for why it stopped rides on the reply and nowhere
+    // else. `finish_reason` above is this word normalized, not a second copy of
+    // it — writing the raw one twice would let the two disagree.
+    reply,
     bytes,
     rate_limit: http.rate_limit,
     // Nothing was understood: no text, no tool call, no token count. Either the
@@ -1531,11 +1619,6 @@ function normalize(value: Record<string, unknown>): Usage | undefined {
     // Gemini bills the prompt its built-in tools generate on top of the prompt.
     input: Math.max(0, prompt - inclusive) + num(value["toolUsePromptTokenCount"]),
     ...(cached ? { cache_read: cacheRead, cache_write: cacheWrite } : {}),
-    // The cache write split, when the provider reports it. The two TTLs are
-    // priced differently and opencode's own catalog has a single write rate, so
-    // this is the one number that lets a reader be more exact than opencode is.
-    ...(write5m ? { cache_write_5m: write5m } : {}),
-    ...(write1h ? { cache_write_1h: write1h } : {}),
     output:
       num(value["output_tokens"]) +
       num(value["outputTokens"]) +
@@ -1545,6 +1628,7 @@ function normalize(value: Record<string, unknown>): Usage | undefined {
     ...(thinks ? { reasoning: num(outputDetails["reasoning_tokens"]) + num(value["reasoning_tokens"]) + thoughts } : {}),
     prompt: 0,
     total: 0,
+    source: "provider",
     native: value,
   }
   usage.prompt = usage.input + (usage.cache_read ?? 0) + (usage.cache_write ?? 0)
@@ -1552,12 +1636,23 @@ function normalize(value: Record<string, unknown>): Usage | undefined {
   // Every counter came back zero, which is not a bill: it is a `usage` object
   // that held nothing this file knows how to read.
   if (usage.total === 0) return undefined
-  usage.cache_hit_rate = usage.prompt && usage.cache_read !== undefined ? round2(usage.cache_read / usage.prompt) : undefined
+
   // The provider's own total, kept only when it disagrees with ours. Silence
   // means the two agree; a number here means a counter this file did not read,
-  // and it is the alarm that the sum below is short.
+  // and it is the alarm that the sum above is short by exactly the difference.
   const reported = num(value["total_tokens"]) + num(value["totalTokens"]) + num(value["totalTokenCount"])
-  if (reported && reported !== usage.total) usage.reported_total = reported
+  const details = {
+    // The cache write split, when the provider reports it. The two TTLs are
+    // priced differently and opencode's own catalog has a single write rate, so
+    // this is the one number that lets a reader be more exact than opencode is
+    // — and it is also what says which window this turn's cache expires in.
+    ...(write5m ? { cache_write_5m: write5m } : {}),
+    ...(write1h ? { cache_write_1h: write1h } : {}),
+    ...(reported && reported !== usage.total
+      ? { reported_total: reported, total_mismatch: reported - usage.total }
+      : {}),
+  }
+  if (Object.keys(details).length) usage.details = details
   return usage
 }
 
@@ -1599,8 +1694,8 @@ function hostOf(url: string) {
 
 // Anthropic and the OpenAI dialects name the model in the body; Gemini and
 // Bedrock put it in the path. Only the fallback for when the hooks said nothing.
-function modelOf(request: { url: string; body: unknown }) {
-  const named = str(record(request.body)?.["model"])
+function modelOf(request: Wire) {
+  const named = str(request.body["model"])
   return named ?? /\/models?\/([^:/?]+)/.exec(request.url)?.[1]
 }
 
