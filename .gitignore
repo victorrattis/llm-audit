@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Claude Code, which are created inside the project
+.claude
+
+# Editor leftovers
+*.swp
+*.swo
+*~
+
+# Dependencies, should a package.json ever land here
+node_modules/
+
+# Local environment
+.env
+.env.*
+
+# What these plugins produce. An audit folder holds the prompts verbatim —
+# system prompt, tool schemas, every message and every tool result — so it is
+# never something to commit, however convenient the path.
+*audit-log*/
+*audit-simple*/
