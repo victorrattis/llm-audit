@@ -1164,10 +1164,10 @@ function describeResponse(
     return { ...http, bytes, encoding: "binary" }
   const body = new TextDecoder().decode(buffer)
   const streamed = type.includes("event-stream") || body.startsWith("data:") || body.startsWith("event:")
-  const payload = streamed ? sse(body) : json(body)
   // A rejected request has no reply to assemble: what it has instead is the
   // reason, which is the whole of what the turn is worth reading for.
-  if (status >= 400) return { ...http, error: payload, bytes }
+  if (status >= 400) return { ...http, error: errorBody(body, streamed), bytes }
+  const payload = streamed ? sse(body) : json(body)
 
   const reply = readReply(payload)
   const usage = usageOf(payload)
@@ -1266,6 +1266,28 @@ function finishReason(native: string | undefined, hasToolCalls: boolean) {
 function describeError(error: unknown) {
   if (error instanceof Error) return { name: error.name, message: error.message, cause: causeOf(error.cause) }
   return { message: typeof error === "string" ? error : JSON.stringify(error) }
+}
+
+/**
+ * The body of a rejected turn, read for what it says rather than for how it was
+ * announced.
+ *
+ * A provider that streams its answers keeps the streaming content type on the
+ * rejection too, but the rejection itself is one plain JSON object with no
+ * `data:` frame to find. Read as SSE it yields nothing, and a 400 whose message
+ * is the entire reason to keep the turn gets written as `[]`. So the frames only
+ * count if there were frames, and the body is kept whatever shape it turns out
+ * to have: text this file cannot parse is still the reason the request failed.
+ */
+function errorBody(body: string, streamed: boolean): unknown {
+  if (streamed) {
+    const events = sse(body)
+    if (events.length) return events
+  }
+  const payload = json(body)
+  // `json` hands back the string it could not parse. An empty one says nothing
+  // the status has not already said.
+  return typeof payload === "string" && !payload.trim() ? undefined : payload
 }
 
 // Server-sent events as the providers emit them: one JSON payload per `data:`
