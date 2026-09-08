@@ -67,11 +67,21 @@
 //
 // The recorder runs inside every `fetch` the process makes, so the cost of
 // deciding *not* to record is paid far more often than the cost of recording.
-// Hence the rule the code keeps: nothing is parsed, serialized or walked until
-// a scan of the raw bytes says this request is worth it. A body is parsed once,
-// at the door, and carried from there; the cache markers are walked in the
-// parsed structure rather than in a second copy of it as text; and the size of
-// the prompt is read off the string instead of being summed.
+// Hence the first rule the code keeps: nothing is parsed, serialized or walked
+// until a scan of the raw bytes says this request is worth it. The cache markers
+// are then walked in the parsed structure rather than in a second copy of it as
+// text, and the size of the prompt is read off the string instead of summed.
+//
+// The second rule is that none of it happens before the request does. The gate
+// is the method and one scan of the bytes; then the call goes out, and only then
+// is the body parsed, the folder opened and the turn described — beside the
+// request rather than in front of it. Nothing opencode is waiting on waits on
+// this file.
+//
+// The third is that bytes are never written twice. The body goes into the turn
+// file exactly as it went onto the wire, spliced in as the string it already
+// was, because serializing the parse of a body is writing the same bytes a
+// second time — and in a second arrangement, which is not what was sent.
 //
 // The response is the opposite: the frames are folded into the answer they
 // describe, because a stream is the same reply written twice, in pieces, in a
@@ -102,7 +112,7 @@
 // verbatim, so treat the directory as sensitive.
 //
 // How it hooks in: it wraps the process's `fetch` and records the calls whose
-// shape says "model request" (see `modelCall`), so it covers every provider —
+// shape says "model request" (see `modelBody`), so it covers every provider —
 // the bytes recorded are the bytes on the wire. The one hook it uses,
 // `chat.params`, only reads the session id and never writes to its output, so
 // arming this cannot change what opencode does.
@@ -121,6 +131,12 @@ const SHORT_QUERY_NAME = /^(key|sig)$/i
 // say how much room was left.
 const PUBLIC_NAME = /ratelimit|rate-limit|retry-after|token-count/i
 const TEXT_CONTENT = /^(text\/|application\/(json|x-ndjson|jsonl|.*\+json))/i
+
+// The two spellings of a cache marker, in one pass over the bytes. A body that
+// carries neither is scanned to its end, and that is the common case — all of
+// the OpenAI and Gemini traffic — so testing the two separately would scan the
+// whole prompt twice to conclude the same nothing.
+const CACHE_MARK = /"cache(_control|Point)"/
 
 // Paths the model APIs use: OpenAI-style completions and responses, Anthropic
 // messages, Gemini generateContent, Bedrock converse/invoke, Cohere-style chat.
@@ -142,6 +158,12 @@ const MODEL_BODY = /"(messages|contents|system_instruction|systemInstruction)"\s
 
 // Turns that arrive without a session id still have to be written somewhere.
 const NO_SESSION = "sem-sessao"
+
+// The stand-in `request.body` carries through the turn object, so the bytes that
+// went out can be spliced into the file exactly as they were sent instead of
+// being serialized a second time from the parse of themselves. Random per
+// process and carrying a NUL, so no body can contain it by accident.
+const BODY_MARK = `\u0000llm-audit:body:${Math.random().toString(36).slice(2)}\u0000`
 
 // The folder's index: one line per turn, next to the turns themselves.
 const INDEX_FILE = "turns.json"
@@ -291,6 +313,16 @@ type Reply = {
   stop_reason?: string
 }
 
+/** Which response this was, folded out of whatever frame first named it. */
+type Identity = { id?: string; model?: string }
+
+/**
+ * The token bill under construction. `found` is not `merged` being non-empty: a
+ * `usage` object the provider sent and this file could read nothing out of is
+ * still a bill that was reported, and a different finding from none at all.
+ */
+type Bill = { merged: Record<string, unknown>; found: boolean }
+
 /** A reply under construction, while the frames are still arriving. */
 type Draft = {
   text: string[]
@@ -335,6 +367,9 @@ type Session = {
   // The `turns.json` index in memory, read back from the file when the folder is
   // reopened so a restart appends to the index instead of starting it over.
   rows: Record<string, unknown>[]
+  // Whether a write of the index is already queued, so a burst of turns costs
+  // one rewrite of the file instead of one per turn.
+  indexQueued?: boolean
 }
 
 type State = {
@@ -357,7 +392,7 @@ type State = {
   sessions: Map<string, Session>
   // Turns whose response has not landed yet, by path, so a request still in
   // flight when the process exits leaves a record all the same.
-  pending: Map<string, { head: Record<string, unknown>; request: unknown }>
+  pending: Map<string, { head: Record<string, unknown>; request: unknown; raw: string }>
   queue: Promise<void>
 }
 
@@ -466,16 +501,32 @@ function install(state: State) {
   if (global["__opencodeLLMAuditFetch"]) return
   const original = globalThis.fetch
   const patched = (input: Parameters<FetchLike>[0], init?: Parameters<FetchLike>[1]) => {
+    // The cheap gate, in the order that turns traffic away for the least work:
+    // the method first, because a GET can never be a model call and `rawBody`
+    // would decode a whole binary body to find that out; then one scan of the
+    // bytes for the key that means "this is a prompt".
     const method = (init?.method ?? methodOf(input) ?? "GET").toUpperCase()
+    if (method !== "POST") return original(input, init)
     const raw = rawBody(init?.body)
+    if (typeof raw !== "string" || !MODEL_BODY.test(raw)) return original(input, init)
+
+    // Past here nothing is allowed to hold the request back. The clock is read,
+    // the call goes out, and the body is parsed while it is already on its way:
+    // the parse, the redaction, the folder and the three synchronous `fs` calls
+    // that open it all used to sit between opencode and the provider. What is
+    // recorded is unchanged — the tests below are the same ones, on the same
+    // parsed keys, only now they run beside the request instead of before it.
+    const started = Date.now()
     const url = urlOf(input)
-    const body = modelCall(method, url, raw)
-    if (!body) return original(input, init)
+    const inflight = original(input, init)
+
+    const body = modelBody(url, raw)
+    if (!body) return inflight
     // Only a model call pays for the headers: redacting them builds a `Headers`
     // and walks it, and by here the traffic is the traffic worth recording.
-    const request: Wire = { method, url, raw: raw as string, body,
+    const request: Wire = { method, url, raw, body,
                             headers: redactHeaders(init?.headers ?? headersOf(input)) }
-    return capture(state, request, () => original(input, init))
+    return capture(state, request, inflight, started)
   }
   // Carries over anything the runtime hangs off fetch (Bun's `preconnect`).
   global["__opencodeLLMAuditFetch"] = true
@@ -495,15 +546,13 @@ function install(state: State) {
  * The order is the point. `fetch` is wrapped for the whole process, so this runs
  * on every call the process makes, and the parse is the expensive step —
  * proportional to a body that, for a warm conversation, is most of a megabyte.
- * So the bytes are scanned first, and only a body that already looks like a
- * prompt or already names a model is ever parsed. Everything else — telemetry,
- * opencode's own APIs, whatever else the process talks to — is turned away for
- * the cost of one scan of the bytes. What is *recorded* is unchanged: the tests below the
- * gate are the same ones, on the same parsed keys.
+ * So the bytes are scanned first, in `install`, and only a body that already
+ * looks like a prompt or already names a model ever reaches here to be parsed.
+ * Everything else — telemetry, opencode's own APIs, whatever else the process
+ * talks to — is turned away for the cost of one scan of the bytes, and the
+ * request that does reach here is already on the wire by the time it does.
  */
-function modelCall(method: string, url: string, raw: string | undefined) {
-  if (method !== "POST" || typeof raw !== "string") return undefined
-  if (!MODEL_BODY.test(raw)) return undefined
+function modelBody(url: string, raw: string) {
   const body = record(json(raw))
   if (!body) return undefined
   const shape =
@@ -513,8 +562,11 @@ function modelCall(method: string, url: string, raw: string | undefined) {
   return named ? body : undefined
 }
 
-async function capture(state: State, request: Wire, send: () => Promise<Response>) {
-  const started = Date.now()
+async function capture(state: State, request: Wire, inflight: Promise<Response>, started: number) {
+  // The bytes that went out, kept as the string they arrived as: it is what the
+  // turn file writes back out verbatim, and holding it instead of the parsed
+  // body lets that object graph go once the head below has been read off it.
+  const raw = request.raw
   // opencode names the session on every request it makes, and a subagent also
   // names whoever spawned it — its turns are that conversation's work, so they
   // are filed in that folder and numbered in the same sequence.
@@ -522,7 +574,7 @@ async function capture(state: State, request: Wire, send: () => Promise<Response
   const parent = headerOf(request, "x-parent-session-id")
   if (wire !== NO_SESSION && parent) state.parents.set(wire, parent)
   const sess = openSession(state, rootOf(state, wire))
-  if (!sess) return send()
+  if (!sess) return inflight
   const turn = ++sess.turns
   const file = path.join(sess.dir, `turn_${String(turn).padStart(3, "0")}.json`)
   const context = state.contexts.get(wire) ?? (state.recent ? state.contexts.get(state.recent) : undefined)
@@ -544,7 +596,7 @@ async function capture(state: State, request: Wire, send: () => Promise<Response
     user_message: state.messages.get(wire) ?? headerOf(request, "x-opencode-request"),
     started_at: new Date(started).toISOString(),
   }
-  state.pending.set(file, { head, request: sent })
+  state.pending.set(file, { head, request: sent, raw })
 
   // The rest of the head is only knowable once the answer is in: how long it
   // took, and which pricing tier this prompt fell into.
@@ -562,10 +614,11 @@ async function capture(state: State, request: Wire, send: () => Promise<Response
       },
       sent,
       response,
+      raw,
     )
 
   try {
-    const response = await send()
+    const response = await inflight
     const status = response.status
     const headers = redactHeaders(response.headers)
     const type = response.headers.get("content-type") ?? ""
@@ -740,15 +793,52 @@ function write(
   head: Record<string, unknown>,
   request: unknown,
   response: Record<string, unknown>,
+  raw: string,
 ) {
   state.pending.delete(file)
   // The row is built from the response as it came, before `turnOf` splits it:
   // the index is the plugin's own, and nothing in it moved.
-  sess.rows.push(rowOf(head, path.basename(file), request, response))
+  insertRow(sess.rows, rowOf(head, path.basename(file), request, response))
   state.queue = state.queue
-    .then(() => fs.promises.writeFile(file, text(turnOf(head, request, response))))
-    .then(() => fs.promises.writeFile(path.join(sess.dir, INDEX_FILE), text(index(sess))))
+    .then(() => fs.promises.writeFile(file, text(turnOf(head, request, response), raw)))
     .catch(() => undefined)
+  queueIndex(state, sess)
+}
+
+/**
+ * The index, written once per drain rather than once per turn.
+ *
+ * The file is the whole list every time, so writing it after every turn rewrites
+ * a file that grows with the conversation — quadratic over a session, to produce
+ * a state only the last one of which anybody reads. A row is in `sess.rows`
+ * before this is called, so a write already queued and not yet started will
+ * carry it, and a burst of turns collapses into a single write. `flush` writes
+ * it once more at exit, which is what makes the final state exact.
+ */
+function queueIndex(state: State, sess: Session) {
+  if (sess.indexQueued) return
+  sess.indexQueued = true
+  state.queue = state.queue
+    .then(() => {
+      // Cleared before the list is read, so a row landing during the write
+      // queues another one rather than being left out of the file.
+      sess.indexQueued = false
+      return fs.promises.writeFile(path.join(sess.dir, INDEX_FILE), text(index(sess)))
+    })
+    .catch(() => undefined)
+}
+
+/**
+ * Keeps the rows in turn order as they land, so the index never has to be
+ * sorted to be written. Turns mostly finish in the order they started, so the
+ * scan back from the end stops immediately; a turn that overtook another walks
+ * back only as far as it has to.
+ */
+function insertRow(rows: Record<string, unknown>[], row: Record<string, unknown>) {
+  const turn = num(row["turn"])
+  let at = rows.length
+  while (at > 0 && num(rows[at - 1]?.["turn"]) > turn) at--
+  rows.splice(at, 0, row)
 }
 
 /**
@@ -798,7 +888,7 @@ function index(sess: Session) {
   return {
     session: sess.id === NO_SESSION ? undefined : sess.id,
     updated_at: new Date().toISOString(),
-    turns: [...sess.rows].sort((a, b) => num(a["turn"]) - num(b["turn"])),
+    turns: sess.rows,
   }
 }
 
@@ -815,18 +905,18 @@ function readIndex(dir: string): Record<string, unknown>[] {
 /** Records the turns still in flight, so a request is never silently lost. */
 function flush(state: State) {
   const touched = new Set<Session>()
-  for (const [file, { head, request }] of state.pending) {
+  for (const [file, { head, request, raw }] of state.pending) {
     const response = {
       incomplete: true,
       note: "the process exited while this request was still in flight, so nothing came back to record",
     }
     const sess = [...state.sessions.values()].find((entry) => entry.dir === path.dirname(file))
     if (sess) {
-      sess.rows.push(rowOf(head, path.basename(file), request, response))
+      insertRow(sess.rows, rowOf(head, path.basename(file), request, response))
       touched.add(sess)
     }
     try {
-      fs.writeFileSync(file, text(turnOf(head, request, response)))
+      fs.writeFileSync(file, text(turnOf(head, request, response), raw))
     } catch {
       // Nothing useful to do at exit.
     }
@@ -938,6 +1028,14 @@ function stamp(date: Date) {
 /**
  * The request: the body as it went out, and the little that has to be derived.
  *
+ * The body itself is not carried here but stood in for: `BODY_MARK` marks the
+ * place, and `text` puts the bytes back into it when the file is written. The
+ * body was already in hand as the string that went on the wire, so serializing
+ * the parse of it would be writing the same bytes a second time, in a second
+ * arrangement — and it is the wire bytes, not a re-rendering of them, that this
+ * file promises. It also lets the parsed object graph go here, rather than
+ * being held in `pending` until the answer lands.
+ *
  * The body is stored whole and untouched — the system prompt, the tool schemas,
  * every message, the sampling settings, the cache markers, in the dialect's own
  * shape. The repetition between turns is the point of the log, not noise: the
@@ -960,13 +1058,8 @@ function readRequest(request: Wire) {
   // Nothing is derived about a dialect this file does not know: the body still
   // goes in whole, the way an undecodable response keeps its bytes.
   if (!body || dialect === "unknown")
-    return { ...head, dialect, body: request.body, headers: request.headers }
+    return { ...head, dialect, body: BODY_MARK, headers: request.headers }
 
-  const prompt = {
-    system: systemItems(body, dialect),
-    tools: toolItems(body, dialect),
-    messages: messageItems(body, dialect),
-  }
   return {
     ...head,
     dialect,
@@ -977,8 +1070,8 @@ function readRequest(request: Wire) {
     // messages is not written — nothing read it, and a reader who wants it has
     // the body right here to take it from.
     chars: request.raw.length,
-    cache: cacheView(body, prompt, request.raw),
-    body: request.body,
+    cache: cacheView(body, dialect, request.raw),
+    body: BODY_MARK,
     headers: request.headers,
   }
 }
@@ -1086,19 +1179,26 @@ function unwrap(tool: unknown, name: string) {
  * where they were — this only says where they are, so "where does the cached
  * prefix end" is one question rather than four conventions to know.
  */
-function cacheView(body: Record<string, unknown>, prompt: Record<string, unknown[]>, raw: string) {
+function cacheView(body: Record<string, unknown>, dialect: string, raw: string) {
   const key = str(body["prompt_cache_key"]) ?? str(body["cachedContent"]) ?? str(body["cached_content"])
   const breakpoints: { in: string; index: number; type: string; ttl?: string }[] = []
-  // One scan of the bytes before any structure is walked. A body that never
-  // spells either marker has none to find — which is all of the OpenAI and
-  // Gemini traffic, and every request that asked for no caching — and the whole
-  // search below is skipped for it.
-  if (raw.includes('"cache_control"') || raw.includes('"cachePoint"'))
+  // One scan of the bytes before any structure is located, let alone walked. A
+  // body that never spells a marker has none to find — which is all of the
+  // OpenAI and Gemini traffic, and every request that asked for no caching — and
+  // for it neither the search below nor the work of finding the three parts to
+  // search is done at all.
+  if (CACHE_MARK.test(raw)) {
+    const prompt: Record<string, unknown[]> = {
+      system: systemItems(body, dialect),
+      tools: toolItems(body, dialect),
+      messages: messageItems(body, dialect),
+    }
     for (const [part, items] of Object.entries(prompt))
       items.forEach((item, index) => {
         const marker = cacheOf(item)
         if (marker) breakpoints.push({ in: part, index, ...marker })
       })
+  }
   // No key and no breakpoint is a request that asked for no caching at all,
   // which is a finding of its own — hence an absent field rather than an empty
   // one, so it reads as "nothing asked" and not as "nothing found".
@@ -1168,10 +1268,7 @@ function describeResponse(
   // reason, which is the whole of what the turn is worth reading for.
   if (status >= 400) return { ...http, error: errorBody(body, streamed), bytes }
   const payload = streamed ? sse(body) : json(body)
-
-  const reply = readReply(payload)
-  const usage = usageOf(payload)
-  const { id, model } = identityOf(payload)
+  const { reply, usage, id, model } = foldPayload(payload)
   return {
     request_id: http.request_id,
     id,
@@ -1236,20 +1333,49 @@ function retryAfterOf(headers: Record<string, string>) {
  * fallback after an overload, or a silent downgrade all show up here and
  * nowhere else.
  */
-function identityOf(payload: unknown): { id?: string; model?: string } {
-  const found: { id?: string; model?: string } = {}
-  const visit = (value: unknown) => {
-    const entry = record(value)
-    if (!entry) return
-    // Anthropic carries it inside `message`, the Responses dialect inside
-    // `response`, and the rest put it at the top of the body.
-    const holder = record(entry["message"]) ?? record(entry["response"]) ?? entry
-    found.id ??= str(holder["id"]) ?? str(holder["responseId"])
-    found.model ??= str(holder["model"]) ?? str(holder["modelVersion"])
+function absorbIdentity(found: Identity, event: unknown) {
+  const entry = record(event)
+  if (!entry) return
+  // Anthropic carries it inside `message`, the Responses dialect inside
+  // `response`, and the rest put it at the top of the body.
+  const holder = record(entry["message"]) ?? record(entry["response"]) ?? entry
+  found.id ??= str(holder["id"]) ?? str(holder["responseId"])
+  found.model ??= str(holder["model"]) ?? str(holder["modelVersion"])
+}
+
+/**
+ * One pass over the frames, for everything that has to be read out of them.
+ *
+ * A stream is thousands of frames, and the reply, the token bill and the
+ * response's identity were each a walk over all of them. None of the three
+ * depends on the others, and none depends on the order the frames arrive in —
+ * `merge` keeps the larger of each counter and the identity keeps the first of
+ * each name — so one loop does what three did.
+ */
+function foldPayload(payload: unknown) {
+  const draft: Draft = { text: [], reasoning: [], calls: new Map() }
+  const bill: Bill = { merged: {}, found: false }
+  const found: Identity = {}
+  // A payload that is not a structure never had a reply in it. The other two
+  // readers find nothing in one either, and say so themselves.
+  const foldable = payload !== undefined && payload !== null && typeof payload !== "string"
+  const list = Array.isArray(payload)
+  // A frame of a list sits one level inside it, which is the depth the token
+  // search was already budgeted against when it walked the list itself.
+  const depth = list ? 1 : 0
+  const one = (event: unknown) => {
+    if (foldable) absorb(draft, event)
+    absorbUsage(bill, event, depth)
+    absorbIdentity(found, event)
   }
-  if (Array.isArray(payload)) payload.forEach(visit)
-  else visit(payload)
-  return found
+  if (list) (payload as unknown[]).forEach(one)
+  else one(payload)
+  return {
+    reply: foldable ? replyOf(draft) : undefined,
+    usage: bill.found ? normalize(bill.merged) : undefined,
+    id: found.id,
+    model: found.model,
+  }
 }
 
 /** The provider's reason for stopping, in opencode's vocabulary. */
@@ -1307,18 +1433,12 @@ function sse(body: string) {
 }
 
 /**
- * The reply, folded out of whatever the provider sent.
+ * The reply, closed out once every frame has been folded into the draft.
  *
- * One pass for every dialect, because they overlap: the same block shapes show
- * up in a streaming frame, in a non-streaming `content` array and in a
- * Responses `output` item.
+ * Nothing at all is a reply that never happened, and an absent `reply` says so
+ * — where an empty one would claim the model answered with silence.
  */
-function readReply(payload: unknown): Reply | undefined {
-  if (payload === undefined || payload === null || typeof payload === "string") return undefined
-  const draft: Draft = { text: [], reasoning: [], calls: new Map() }
-  if (Array.isArray(payload)) payload.forEach((event) => absorb(draft, event))
-  else absorb(draft, payload)
-
+function replyOf(draft: Draft): Reply | undefined {
   const text = draft.text.join("")
   const reasoning = draft.reasoning.join("")
   const calls = [...draft.calls.values()].filter((call) => call.name || call.args)
@@ -1337,7 +1457,13 @@ function readReply(payload: unknown): Reply | undefined {
   }
 }
 
-/** Folds one frame, or one whole body, into the draft. */
+/**
+ * Folds one frame, or one whole body, into the draft.
+ *
+ * One pass for every dialect, because they overlap: the same block shapes show
+ * up in a streaming frame, in a non-streaming `content` array and in a
+ * Responses `output` item.
+ */
 function absorb(draft: Draft, event: unknown) {
   const value = record(event)
   if (!value) return
@@ -1549,24 +1675,17 @@ function textOf(value: unknown, depth = 0): string {
  * one — so the frames are merged, taking the larger of each counter, before
  * anything is read out of them.
  */
-function usageOf(payload: unknown): Usage | undefined {
-  const merged: Record<string, unknown> = {}
-  let found = false
-  const visit = (value: unknown, depth: number) => {
-    if (depth > 8 || value === null || typeof value !== "object") return
-    if (Array.isArray(value)) return value.forEach((item) => visit(item, depth + 1))
-    for (const [name, item] of Object.entries(value)) {
-      if (USAGE_KEY.test(name) && isRecord(item)) {
-        merge(merged, item)
-        found = true
-        continue
-      }
-      visit(item, depth + 1)
+function absorbUsage(bill: Bill, value: unknown, depth: number) {
+  if (depth > 8 || value === null || typeof value !== "object") return
+  if (Array.isArray(value)) return value.forEach((item) => absorbUsage(bill, item, depth + 1))
+  for (const [name, item] of Object.entries(value)) {
+    if (USAGE_KEY.test(name) && isRecord(item)) {
+      merge(bill.merged, item)
+      bill.found = true
+      continue
     }
+    absorbUsage(bill, item, depth + 1)
   }
-  visit(payload, 0)
-  if (!found) return undefined
-  return normalize(merged)
 }
 
 function merge(target: Record<string, unknown>, source: Record<string, unknown>) {
@@ -1760,8 +1879,34 @@ function json(value: string) {
   }
 }
 
-function text(value: unknown) {
-  return JSON.stringify(value, (_key, item) => (typeof item === "bigint" ? String(item) : item), 2) + "\n"
+/**
+ * The turn, as the file holds it: everything serialized, and the request body
+ * put back where its placeholder sits, byte for byte as it went out.
+ */
+function text(value: unknown, raw?: string) {
+  const out = serialize(value)
+  if (raw === undefined) return out + "\n"
+  const needle = JSON.stringify(BODY_MARK)
+  const at = out.indexOf(needle)
+  // No placeholder is not a failure: a turn written before the body was read,
+  // or one whose body never made it into the object, simply has nothing to put
+  // back. What is never done is guessing at where it would have gone.
+  if (at < 0) return out + "\n"
+  return out.slice(0, at) + raw + out.slice(at + needle.length) + "\n"
+}
+
+/**
+ * The common path first: a replacer is called back on every node in the tree,
+ * and a `bigint` is the only thing it exists for. So the plain serialization is
+ * tried, and the replacer pays for itself only on the tree that actually holds
+ * one — which is the tree that just threw.
+ */
+function serialize(value: unknown) {
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return JSON.stringify(value, (_key, item) => (typeof item === "bigint" ? String(item) : item), 2)
+  }
 }
 
 function causeOf(cause: unknown) {
