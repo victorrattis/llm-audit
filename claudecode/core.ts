@@ -1405,7 +1405,14 @@ function absorb(draft: Draft, event: unknown) {
       arrayOf(message["tool_calls"]).forEach((item, position) => {
         const use = record(item)
         if (!use) return
-        const target = call(draft, key(use["id"] ?? use["index"] ?? position))
+        // `index` first, because it is the only name the whole stream agrees
+        // on: the frame that opens a call carries the id and the function name,
+        // and every frame after it carries nothing but `index` and a slice of
+        // the arguments. Keyed by id, one call becomes two — a name with no
+        // arguments, then arguments with no name, which is what put the nulls
+        // in the index line. A body that arrives whole carries no `index`, and
+        // there the id is what tells two calls apart.
+        const target = call(draft, key(use["index"] ?? use["id"] ?? position))
         const fn = record(use["function"]) ?? use
         target.name = str(fn["name"]) ?? target.name
         if (typeof fn["arguments"] === "string") target.args += fn["arguments"]
