@@ -389,6 +389,11 @@ type State = {
   // has said whose subagent it is.
   requests: Map<string, number>
   messages: Map<string, string>
+  // What each conversation is called, by session id. The name never goes over
+  // the wire — opencode hands it to a plugin on the session events, and the
+  // `title` agent only writes it after the first reply, so the first turn of a
+  // conversation is normally recorded before there is a name to record.
+  titles: Map<string, string>
   sessions: Map<string, Session>
   // Turns whose response has not landed yet, by path, so a request still in
   // flight when the process exits leaves a record all the same.
@@ -400,11 +405,28 @@ export const LLMAuditPlugin: Plugin = async (_input, options) => {
   const settings = resolve(options)
   if (!settings.enabled) return {}
   const state = shared(settings)
+  // The state outlives a reload of the plugin — it is kept on `globalThis` — so
+  // one built by an older copy comes back without the newer maps on it.
+  state.titles ??= new Map()
   install(state)
 
-  // The two hooks exist only to learn what the wire cannot carry. Neither writes
+  // The hooks exist only to learn what the wire cannot carry. None of them writes
   // to its `output`, so arming the audit cannot change what opencode does.
   return {
+    /**
+     * What the conversation is called. `session.created`, `session.updated` and
+     * `session.deleted` all carry the session under `properties.info`, so the
+     * name is read off the shape rather than off the event's type — the same
+     * caution `chat.params` is read with, and for the same reason.
+     */
+    async event(input) {
+      const properties = record(record(record(input)?.["event"])?.["properties"])
+      const info = record(properties?.["info"])
+      const id = str(info?.["id"])
+      const title = str(info?.["title"])
+      if (id && title) state.titles.set(id, title)
+    },
+
     async "chat.params"(input) {
       state.recent = input.sessionID
       const model = record(input.model)
@@ -487,6 +509,7 @@ function shared(settings: Settings): State {
     parents: new Map(),
     requests: new Map(),
     messages: new Map(),
+    titles: new Map(),
     sessions: new Map(),
     pending: new Map(),
     queue: Promise.resolve(),
@@ -594,6 +617,12 @@ async function capture(state: State, request: Wire, inflight: Promise<Response>,
     // From the hook, or from the header the opencode-hosted providers carry it
     // in — the same id, by two roads.
     user_message: state.messages.get(wire) ?? headerOf(request, "x-opencode-request"),
+    // The name of the conversation this folder is — `rootOf` has already
+    // resolved a subagent to whoever spawned it, and it is that one's work the
+    // folder holds. Absent until opencode names the session, like every other
+    // field here that is not known yet.
+    title: state.titles.get(sess.id),
+    title_source: state.titles.get(sess.id) ? "session" : undefined,
     started_at: new Date(started).toISOString(),
   }
   state.pending.set(file, { head, request: sent, raw })
@@ -823,7 +852,7 @@ function queueIndex(state: State, sess: Session) {
       // Cleared before the list is read, so a row landing during the write
       // queues another one rather than being left out of the file.
       sess.indexQueued = false
-      return fs.promises.writeFile(path.join(sess.dir, INDEX_FILE), text(index(sess)))
+      return fs.promises.writeFile(path.join(sess.dir, INDEX_FILE), text(index(sess, state)))
     })
     .catch(() => undefined)
 }
@@ -884,9 +913,12 @@ function rowOf(head: Record<string, unknown>, file: string, request: unknown, re
 }
 
 /** The folder's index, turns in order however the answers came back. */
-function index(sess: Session) {
+function index(sess: Session, state: State) {
   return {
     session: sess.id === NO_SESSION ? undefined : sess.id,
+    // The name as it stands now, where the turns carry the one each was written
+    // under: this file is rewritten on every turn, so it is the current one.
+    title: state.titles.get(sess.id),
     updated_at: new Date().toISOString(),
     turns: sess.rows,
   }
@@ -926,7 +958,7 @@ function flush(state: State) {
   // too late for the queue, so these writes are synchronous.
   for (const sess of touched) {
     try {
-      fs.writeFileSync(path.join(sess.dir, INDEX_FILE), text(index(sess)))
+      fs.writeFileSync(path.join(sess.dir, INDEX_FILE), text(index(sess, state)))
     } catch {
       // Nothing useful to do at exit.
     }
