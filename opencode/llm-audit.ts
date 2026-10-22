@@ -116,6 +116,11 @@
 // the bytes recorded are the bytes on the wire. The one hook it uses,
 // `chat.params`, only reads the session id and never writes to its output, so
 // arming this cannot change what opencode does.
+//
+// opencode 2.x has no `fetch` to wrap; it hands a plugin the request and the
+// response through its own session hooks. `v2/server.ts`, beside this
+// file, is that entry: it feeds the same recorder, so a 2.x folder is the
+// folder this file would have written.
 import type { Plugin, PluginOptions } from "@opencode-ai/plugin"
 import fs from "node:fs"
 import os from "node:os"
@@ -355,7 +360,10 @@ type Context = {
   providerID?: string
   modelID?: string
   variant?: string
-  cost?: Record<string, unknown>
+  // opencode 1.x hands the price over as one object (`tiers`, or the older
+  // `experimentalOver200K`); 2.x lists it as an array of tiers, base price first.
+  // `ratesOf` reads both.
+  cost?: Record<string, unknown> | unknown[]
   contextLimit?: number
 }
 
@@ -520,6 +528,7 @@ function shared(settings: Settings): State {
 
 /** Wraps the process's fetch, once. */
 function install(state: State) {
+  watchExit(state)
   const global = globalThis as Record<string, unknown>
   if (global["__opencodeLLMAuditFetch"]) return
   const original = globalThis.fetch
@@ -554,7 +563,13 @@ function install(state: State) {
   // Carries over anything the runtime hangs off fetch (Bun's `preconnect`).
   global["__opencodeLLMAuditFetch"] = true
   globalThis.fetch = Object.assign(patched, original) as FetchLike
-  // Written synchronously: an exit handler is too late for the queue.
+}
+
+/** Written synchronously: an exit handler is too late for the queue. Once. */
+function watchExit(state: State) {
+  const global = globalThis as Record<string, unknown>
+  if (global["__opencodeLLMAuditExit"]) return
+  global["__opencodeLLMAuditExit"] = true
   process.on("exit", () => flush(state))
 }
 
@@ -585,15 +600,24 @@ function modelBody(url: string, raw: string) {
   return named ? body : undefined
 }
 
-async function capture(state: State, request: Wire, inflight: Promise<Response>, started: number) {
+async function capture(
+  state: State,
+  request: Wire,
+  inflight: Promise<Response>,
+  started: number,
+  known?: { session?: string },
+) {
   // The bytes that went out, kept as the string they arrived as: it is what the
   // turn file writes back out verbatim, and holding it instead of the parsed
   // body lets that object graph go once the head below has been read off it.
   const raw = request.raw
   // opencode names the session on every request it makes, and a subagent also
   // names whoever spawned it — its turns are that conversation's work, so they
-  // are filed in that folder and numbered in the same sequence.
-  const wire = sessionOf(state, request)
+  // are filed in that folder and numbered in the same sequence. On 2.x the
+  // session headers carry the cache-routing id instead (a subagent's is its
+  // parent's, a fork's is its source's), so the 2.x entry passes the session
+  // its hook was handed and that wins.
+  const wire = known?.session ?? sessionOf(state, request)
   const parent = headerOf(request, "x-parent-session-id")
   if (wire !== NO_SESSION && parent) state.parents.set(wire, parent)
   const sess = openSession(state, rootOf(state, wire))
@@ -747,6 +771,7 @@ async function timedBody(response: Response, started: number): Promise<{ buffer?
 function ratesOf(context: Context | undefined, prompt: number) {
   const cost = context?.cost
   if (!cost) return {}
+  if (Array.isArray(cost)) return ratesOfTiers(cost, prompt)
   let rates = cost
   let tier = "base"
   const tiers = arrayOf(cost["tiers"])
@@ -773,6 +798,42 @@ function ratesOf(context: Context | undefined, prompt: number) {
       cache_write: num(cache?.["write"]),
     },
     rates_tier: tier,
+  }
+}
+
+/**
+ * The same resolution for the 2.x catalog, which lists the price as an array: a
+ * base entry, and one entry per context tier carrying `tier: { type, size }`.
+ * Same rule as above — the largest tier the prompt went over, else the base —
+ * and the same names on the way out. An entry that is not a usable price is
+ * skipped, and a model with none leaves the turn without rates rather than with
+ * a zero that reads as "free".
+ */
+function ratesOfTiers(items: unknown[], prompt: number) {
+  const usable = items
+    .map((item) => record(item))
+    .filter(
+      (item): item is Record<string, unknown> =>
+        !!item && typeof item["input"] === "number" && typeof item["output"] === "number",
+    )
+  const base = usable.find((item) => !record(item["tier"])) ?? usable[0]
+  if (!base) return {}
+  const over = usable
+    .filter((item) => {
+      const at = record(item["tier"])
+      return at?.["type"] === "context" && prompt > num(at["size"])
+    })
+    .sort((a, b) => num(record(b["tier"])?.["size"]) - num(record(a["tier"])?.["size"]))[0]
+  const rates = over ?? base
+  const cache = record(rates["cache"])
+  return {
+    rates_per_million: {
+      input: num(rates["input"]),
+      output: num(rates["output"]),
+      cache_read: num(cache?.["read"]),
+      cache_write: num(cache?.["write"]),
+    },
+    rates_tier: over ? `context>${num(record(over["tier"])?.["size"])}` : "base",
   }
 }
 
@@ -830,7 +891,7 @@ function write(
   insertRow(sess.rows, rowOf(head, path.basename(file), request, response))
   state.queue = state.queue
     .then(() => fs.promises.writeFile(file, text(turnOf(head, request, response), raw)))
-    .catch(() => undefined)
+    .catch((error) => auditDiagnostic("turn write", file, error))
   queueIndex(state, sess)
 }
 
@@ -854,7 +915,7 @@ function queueIndex(state: State, sess: Session) {
       sess.indexQueued = false
       return fs.promises.writeFile(path.join(sess.dir, INDEX_FILE), text(index(sess, state)))
     })
-    .catch(() => undefined)
+    .catch((error) => auditDiagnostic("index write", sess.dir, error))
 }
 
 /**
@@ -1000,9 +1061,29 @@ function openSession(state: State, id: string): Session | undefined {
     }
     state.sessions.set(id, created)
     return created
-  } catch {
+  } catch (error) {
+    // The turn that wanted this folder is not recorded, which is exactly what
+    // someone running an audit has to be told.
+    auditDiagnostic("session folder", state.settings.dir, error)
     return undefined
   }
+}
+
+/**
+ * Says an audit write failed, once per kind of failure: a disk that is full or a
+ * folder that is read-only would otherwise repeat the line on every turn. It
+ * names the operation, the path and the error code and message — never the
+ * request, whose body and headers are the sensitive part.
+ */
+const diagnosed = new Set<string>()
+function auditDiagnostic(operation: string, auditPath: string, error: unknown) {
+  const failure = record(error)
+  const code = str(failure?.["code"]) ?? "unknown"
+  const key = `${operation}:${code}`
+  if (diagnosed.has(key)) return
+  diagnosed.add(key)
+  const message = str(failure?.["message"]) ?? String(error)
+  console.warn(`[llm-audit] ${operation} failed; audit_path=${auditPath}; code=${code}; error=${message}`)
 }
 
 /**
@@ -1980,4 +2061,17 @@ function str(value: unknown) {
 
 function num(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : 0
+}
+
+// What `v2/server.ts` borrows. opencode 1.x calls every export of a plugin
+// file as a plugin, so nothing but `LLMAuditPlugin` can be exported from here;
+// the 2.x entry reads these off `globalThis` instead, after importing this file.
+;(globalThis as Record<string, unknown>)["__opencodeLLMAuditCore"] = {
+  resolve,
+  shared,
+  watchExit,
+  capture,
+  modelBody,
+  redactHeaders,
+  MODEL_BODY,
 }

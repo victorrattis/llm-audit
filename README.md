@@ -66,6 +66,42 @@ a plugin folder instead, it loads but stays off until `OPENCODE_LLM_AUDIT=1` or
 `OPENCODE_LLM_AUDIT_DIR=<dir>` says otherwise — armed by the flag alone, it
 writes to `~/.local/share/opencode/log/llm-audit`.
 
+### opencode 2.x
+
+2.x has no `fetch` for a plugin to wrap; it hands over each request and its
+response through its own session hooks. `opencode/v2/` listens there and feeds
+the same recorder, so the folders it writes are the ones 1.x writes.
+
+It is a folder, not a file, because 2.x skips a configured plugin whose path is
+a file — with only a `configured plugin path must be a directory` warning in its
+log, which is why a 1.x entry left in the config records nothing on 2.x. The
+folder's `server.ts` imports `../llm-audit.ts`, so point the config at the
+folder where it sits in this checkout, and load **only** this entry:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "/Users/you/projects/llm-audit/opencode/v2",
+      "options": { "dir": "/Users/you/temp/opencode-audit-log" }
+    }
+  ]
+}
+```
+
+On 2.x the session comes from the hook rather than the headers, which there
+carry the cache-routing id (a subagent's is its parent's, a fork's its
+source's). The price comes from the model catalog, and a turn records the tier
+its prompt fell into (`rates_per_million`, `rates_tier`). Title and summary
+requests stay out of the folder, as on 1.x.
+
+Not recorded on 2.x: a provider driven over a WebSocket — OpenAI and xAI by
+default — whose frames never pass through the HTTP hooks. Setting
+`"provider": { "openai": { "settings": { "transport": "http" } } }` brings it
+back. This path has been run against a stand-in that follows opencode 2.1.3's
+session runner, not against opencode 2.x itself.
+
 `@opencode-ai/plugin` next to it, as `~/.config/opencode/package.json` declares
 it, only buys you type-checking while editing the file.
 
